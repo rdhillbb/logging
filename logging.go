@@ -12,9 +12,17 @@ import (
 // These values can be adjusted based on system requirements.
 const (
     DefaultBufferSize = 1000    // Number of messages that can be buffered before blocking
-    LogDirName       = "logs"   // Name of the directory where log files are stored
+    LogDirName       = "logs"   // Default logs subdirectory name
     LogFilePrefix    = "anthropic-debug"  // Prefix for all log file names
 )
+
+// getLogDirectory determines the base directory for logs based on LOGDIR environment variable
+func getLogDirectory() string {
+    if logDir := os.Getenv("LOGDIR"); logDir != "" {
+        return filepath.Join(logDir, LogDirName)
+    }
+    return LogDirName // Default to current directory
+}
 
 // LogServer represents the core logging infrastructure. Each server instance
 // manages its own log file and message processing goroutine. The server
@@ -135,14 +143,17 @@ func EnableLogging() error {
         return nil
     }
 
+    // Get the log directory based on environment variable
+    logDir := getLogDirectory()
+
     // Ensure log directory exists
-    if err := os.MkdirAll(LogDirName, 0755); err != nil {
+    if err := os.MkdirAll(logDir, 0755); err != nil {
         return fmt.Errorf("failed to create logs directory: %w", err)
     }
 
     // Create new log file with timestamp
     timestamp := time.Now().Format("20060102-150405")
-    filename := filepath.Join(LogDirName, fmt.Sprintf("%s-%s.log", LogFilePrefix, timestamp))
+    filename := filepath.Join(logDir, fmt.Sprintf("%s-%s.log", LogFilePrefix, timestamp))
 
     file, err := os.Create(filename)
     if err != nil {
