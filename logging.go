@@ -1,242 +1,319 @@
 package logging
 
 import (
-    "fmt"
-    "os"
-    "path/filepath"
-    "sync"
-    "time"
+   "bytes"
+   "fmt"
+   "os"
+   "path/filepath"
+   "runtime"
+   "sync"
+   "sync/atomic"
+   "time"
 )
 
-// Configuration constants that define the behavior of the logging system.
-// These values can be adjusted based on system requirements.
 const (
-    DefaultBufferSize = 1000    // Number of messages that can be buffered before blocking
-    LogDirName       = "logs"   // Default logs subdirectory name
-    LogFilePrefix    = "anthropic-debug"  // Prefix for all log file names
+   defaultBufferSize   = 20000    
+   defaultNumWorkers   = 8
+   defaultBatchSize    = 10000
+   defaultFlushIntervalMs = 50
+   maxFileSize        = 1 << 30  // 1GB
+   maxFiles          = 10
+   logDirName        = "logs"
+   logFilePrefix     = "anthropic-debug"
 )
 
-// getLogDirectory determines the base directory for logs based on LOGDIR environment variable
-func getLogDirectory() string {
-    if logDir := os.Getenv("LOGDIR"); logDir != "" {
-        return filepath.Join(logDir, LogDirName)
-    }
-    return LogDirName // Default to current directory
-}
+type LogLevel int32
 
-// LogServer represents the core logging infrastructure. Each server instance
-// manages its own log file and message processing goroutine. The server
-// ensures thread-safe operations through mutex synchronization.
+const (
+   DEBUG LogLevel = iota
+   INFO
+   WARN  
+   ERROR
+   FATAL
+)
+
 type LogServer struct {
-    mu       sync.Mutex      // Mutex for protecting server state changes
-    file     *os.File        // Handle to the current log file
-    enabled  bool            // Flag indicating if logging is active
-    logChan  chan string     // Channel for passing messages to the logging goroutine
-    done     chan struct{}   // Channel for signaling when the logging goroutine has finished
-    bufSize  int            // Size of the message buffer channel
+   mu              sync.RWMutex
+   currentFile     *os.File
+   fileSize        int64
+   enabled         atomic.Bool
+   logChans        []chan logMessage
+   buffers         []*bytes.Buffer
+   numWorkers      int
+   batchSize       int
+   flushInterval   time.Duration
+   logLevel        LogLevel
+   logDir          string
+   rotateSize      int64
+   maxFiles        int
 }
 
-// LogServerOption defines a function type for modifying LogServer settings
-// during initialization. This follows the functional options pattern.
-type LogServerOption func(*LogServer)
+type logMessage struct {
+   timestamp time.Time
+   level     LogLevel
+   file      string
+   line      int
+   text      string
+}
 
-// Global variables for managing the singleton server instance.
-// The mutex protects access to the server pointer during initialization
-// and shutdown operations.
 var (
-    server *LogServer    // Singleton server instance
-    mu     sync.Mutex    // Global mutex for protecting server creation/access
+   server *LogServer
+   once   sync.Once
 )
 
-// WithBufferSize creates an option to configure the size of the logging
-// channel buffer. This allows users to adjust the buffer size based on
-// their specific logging volume requirements.
-func WithBufferSize(size int) LogServerOption {
-    return func(s *LogServer) {
-        if size > 0 {
-            s.bufSize = size
-        }
-    }
+type Config struct {
+   NumWorkers    int
+   BatchSize     int
+   FlushInterval time.Duration
+   LogLevel      LogLevel  
+   LogDir        string
+   RotateSize    int64
+   MaxFiles      int
 }
 
-// getServer safely retrieves the current server instance, creating
-// a new one if necessary. This function ensures thread-safe access
-// to the global server instance.
+func DefaultConfig() Config {
+   return Config{
+       NumWorkers:    defaultNumWorkers,
+       BatchSize:     defaultBatchSize, 
+       FlushInterval: time.Duration(defaultFlushIntervalMs) * time.Millisecond,
+       LogLevel:      INFO,
+       LogDir:        logDirName,
+       RotateSize:    maxFileSize,
+       MaxFiles:      maxFiles,
+   }
+}
+
 func getServer() *LogServer {
-    mu.Lock()
-    if server == nil {
-        s := &LogServer{
-            bufSize: DefaultBufferSize,
-            done:    make(chan struct{}),
-        }
-        s.logChan = make(chan string, s.bufSize)
-        server = s
-    }
-    s := server
-    mu.Unlock()
-    return s
+   once.Do(func() {
+       server = NewLogServer(DefaultConfig())
+   })
+   return server
 }
 
-// InitLogServer initializes or reinitializes the logging system with
-// the provided options. If a server already exists, it's shut down
-// gracefully before the new server is created.
-func InitLogServer(opts ...LogServerOption) {
-    mu.Lock()
-    // If we have an existing server, shut it down first
-    if server != nil {
-        old := server
-        server = nil
-        mu.Unlock() // Release global lock before shutdown
-        
-        // Clean up old server if it exists
-        if old != nil {
-            old.mu.Lock()
-            if old.enabled {
-                old.enabled = false
-                close(old.logChan)
-                old.mu.Unlock()
-                <-old.done // Wait for processor to complete
-                
-                old.mu.Lock()
-                if old.file != nil {
-                    fmt.Fprintf(old.file, "\n=== Session Ended: %s ===\n",
-                        time.Now().Format("2006-01-02 15:04:05"))
-                    old.file.Close()
-                }
-                old.mu.Unlock()
-            } else {
-                old.mu.Unlock()
-            }
-        }
-    } else {
-        mu.Unlock()
-    }
-    
-    // Create and configure new server
-    s := &LogServer{
-        bufSize: DefaultBufferSize,
-        done:    make(chan struct{}),
-    }
-    
-    // Apply any provided options
-    for _, opt := range opts {
-        opt(s)
-    }
-    
-    s.logChan = make(chan string, s.bufSize)
-    
-    // Install new server
-    mu.Lock()
-    server = s
-    mu.Unlock()
+func NewLogServer(config Config) *LogServer {
+   s := &LogServer{
+       logChans:      make([]chan logMessage, config.NumWorkers),
+       buffers:       make([]*bytes.Buffer, config.NumWorkers),
+       numWorkers:    config.NumWorkers,
+       batchSize:     config.BatchSize,
+       flushInterval: config.FlushInterval,
+       logLevel:      config.LogLevel,
+       logDir:        config.LogDir,
+       rotateSize:    config.RotateSize,
+       maxFiles:      config.MaxFiles,
+   }
+
+   for i := 0; i < config.NumWorkers; i++ {
+       s.logChans[i] = make(chan logMessage, defaultBufferSize)
+       s.buffers[i] = bytes.NewBuffer(make([]byte, 0, 1<<24))
+       go s.processWorker(i)
+   }
+
+   go s.periodicFlush()
+   return s
 }
 
-// EnableLogging activates the logging system, creating necessary
-// directories and files. It's safe to call multiple times - subsequent
-// calls will return nil if logging is already enabled.
+func (s *LogServer) processWorker(id int) {
+   buffer := s.buffers[id]
+   count := 0
+
+   for msg := range s.logChans[id] {
+       if !s.enabled.Load() {
+           continue
+       }
+
+       if msg.level < s.logLevel {
+           continue  
+       }
+
+       buffer.WriteString(fmt.Sprintf("[%s] [%s] %s:%d %s\n",
+           msg.timestamp.Format("2006-01-02 15:04:05.000"),
+           levelToString(msg.level),
+           msg.file,
+           msg.line,
+           msg.text))
+       
+       count++
+       if count >= s.batchSize {
+           s.flush(id)
+           count = 0
+       }
+   }
+}
+
+func (s *LogServer) periodicFlush() {
+   ticker := time.NewTicker(s.flushInterval)
+   defer ticker.Stop()
+
+   for range ticker.C {
+       if !s.enabled.Load() {
+           continue
+       }
+       s.flushAll()
+   }
+}
+
+func (s *LogServer) flush(id int) {
+   if s.buffers[id].Len() == 0 {
+       return
+   }
+
+   s.mu.Lock()
+   defer s.mu.Unlock()
+
+   if s.currentFile == nil {
+       return
+   }
+
+   data := s.buffers[id].Bytes()
+   n, err := s.currentFile.Write(data)
+   if err != nil {
+       fmt.Fprintf(os.Stderr, "Error writing to log file: %v\n", err)
+       return
+   }
+
+   s.fileSize += int64(n)
+   s.buffers[id].Reset()
+
+   if s.fileSize >= s.rotateSize {
+       s.rotate()
+   }
+}
+
+func (s *LogServer) flushAll() {
+   for i := 0; i < s.numWorkers; i++ {
+       s.flush(i)
+   }
+   if s.currentFile != nil {
+       s.currentFile.Sync()
+   }
+}
+
+func (s *LogServer) rotate() {
+   if s.currentFile != nil {
+       s.currentFile.Close()
+   }
+
+   // Delete old files if we have too many
+   files, err := filepath.Glob(filepath.Join(s.logDir, fmt.Sprintf("%s-*.log", logFilePrefix)))
+   if err == nil && len(files) >= s.maxFiles {
+       for i := 0; i < len(files)-s.maxFiles+1; i++ {
+           os.Remove(files[i])
+       }
+   }
+
+   // Create new file
+   timestamp := time.Now().Format("20060102-150405")
+   newPath := filepath.Join(s.logDir, fmt.Sprintf("%s-%s.log", logFilePrefix, timestamp))
+   
+   file, err := os.Create(newPath)
+   if err != nil {
+       fmt.Fprintf(os.Stderr, "Error creating new log file: %v\n", err)
+       return
+   }
+
+   s.currentFile = file
+   s.fileSize = 0
+}
+
 func EnableLogging() error {
-    s := getServer()
-    s.mu.Lock()
-    defer s.mu.Unlock()
+   s := getServer()
+   
+   if err := os.MkdirAll(s.logDir, 0755); err != nil {
+       return fmt.Errorf("failed to create log directory: %w", err)
+   }
 
-    if s.enabled {
-        return nil
-    }
+   s.mu.Lock()
+   defer s.mu.Unlock()
 
-    // Get the log directory based on environment variable
-    logDir := getLogDirectory()
+   if s.enabled.Load() {
+       return nil
+   }
 
-    // Ensure log directory exists
-    if err := os.MkdirAll(logDir, 0755); err != nil {
-        return fmt.Errorf("failed to create logs directory: %w", err)
-    }
-
-    // Create new log file with timestamp
-    timestamp := time.Now().Format("20060102-150405")
-    filename := filepath.Join(logDir, fmt.Sprintf("%s-%s.log", LogFilePrefix, timestamp))
-
-    file, err := os.Create(filename)
-    if err != nil {
-        return fmt.Errorf("failed to create log file: %w", err)
-    }
-
-    s.file = file
-    s.enabled = true
-    
-    // Start log processor goroutine
-    go s.processLogs()
-    
-    // Write session start marker
-    fmt.Fprintf(s.file, "=== Session Started: %s ===\n\n", 
-        time.Now().Format("2006-01-02 15:04:05"))
-    
-    return nil
+   s.rotate() // Create initial file
+   s.enabled.Store(true)
+   
+   return nil
 }
 
-// DisableLogging gracefully shuts down the logging system. It ensures
-// all pending messages are written before closing the log file.
 func DisableLogging() {
-    s := getServer()
-    s.mu.Lock()
-    if !s.enabled {
-        s.mu.Unlock()
-        return
-    }
+   s := getServer()
+   s.enabled.Store(false)
+   
+   s.mu.Lock()
+   defer s.mu.Unlock()
 
-    s.enabled = false
-    close(s.logChan)
-    s.mu.Unlock()
-
-    <-s.done // Wait for processor to finish
-
-    s.mu.Lock()
-    if s.file != nil {
-        fmt.Fprintf(s.file, "\n=== Session Ended: %s ===\n",
-            time.Now().Format("2006-01-02 15:04:05"))
-        s.file.Close()
-        s.file = nil
-    }
-    s.mu.Unlock()
+   s.flushAll()
+   if s.currentFile != nil {
+       s.currentFile.Close()
+       s.currentFile = nil
+   }
 }
 
-// processLogs is the main logging goroutine that processes messages
-// from the log channel and writes them to the file. It runs until
-// the log channel is closed.
-func (s *LogServer) processLogs() {
-    defer close(s.done)
-    for text := range s.logChan {
-        s.mu.Lock()
-        if s.file != nil {
-            timestamp := time.Now().Format("2006-01-02 15:04:05.000")
-            fmt.Fprintf(s.file, "[%s] %s\n", timestamp, text)
-        }
-        s.mu.Unlock()
-    }
-}
-
-// WriteLogs asynchronously writes a message to the log file. If the
-// logging system is disabled or the message buffer is full, the
-// message will be dropped.
-func WriteLogs(text string) {
-    s := getServer()
-    if !s.enabled {
-        return
-    }
-    
-    select {
-    case s.logChan <- text:
-        // Message sent successfully
-    default:
-        // Channel is full, log a warning to stderr
-        fmt.Fprintf(os.Stderr, "Warning: Log channel full, message dropped: %s\n", text)
-    }
-}
-
-// IsLoggingEnabled returns whether the logging system is currently
-// active and accepting messages.
 func IsLoggingEnabled() bool {
-    s := getServer()
-    s.mu.Lock()
-    defer s.mu.Unlock()
-    return s.enabled
+   return getServer().enabled.Load()
 }
+
+func SetLogLevel(level LogLevel) {
+   getServer().logLevel = level
+}
+
+func levelToString(level LogLevel) string {
+   switch level {
+   case DEBUG:
+       return "DEBUG"
+   case INFO:
+       return "INFO"
+   case WARN:
+       return "WARN"
+   case ERROR:
+       return "ERROR"
+   case FATAL:
+       return "FATAL"
+   default:
+       return "UNKNOWN"
+   }
+}
+
+func getCallerInfo() (string, int) {
+   _, file, line, ok := runtime.Caller(2)
+   if !ok {
+       return "unknown", 0
+   }
+   return filepath.Base(file), line
+}
+
+func logWithLevel(level LogLevel, text string) {
+   s := getServer()
+   if !s.enabled.Load() || level < s.logLevel {
+       return
+   }
+
+   file, line := getCallerInfo()
+   msg := logMessage{
+       timestamp: time.Now(),
+       level:     level,
+       file:      file,
+       line:      line,
+       text:      text,
+   }
+
+   workerID := time.Now().UnixNano() % int64(s.numWorkers)
+   select {
+   case s.logChans[workerID] <- msg:
+   default:
+       fmt.Fprintf(os.Stderr, "Warning: Log channel full, message dropped: %s\n", text)
+   }
+}
+
+func Debug(text string) { logWithLevel(DEBUG, text) }
+func Info(text string)  { logWithLevel(INFO, text) }
+func Warn(text string)  { logWithLevel(WARN, text) }
+func Error(text string) { logWithLevel(ERROR, text) }
+func Fatal(text string) { 
+   logWithLevel(FATAL, text)
+   os.Exit(1)
+}
+
+// Backward compatibility
+func WriteLogs(text string) { Info(text) }
